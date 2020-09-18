@@ -24,11 +24,14 @@ def ingest(connection, cursor, data, samples, vcffile, dataset_name, dataset_des
     else:
         access_type = "CONTROLLED"
 
-    cursor.execute("""INSERT INTO dataset_table(stable_id, description, access_type,
+    cursor.execute("SELECT MAX(id) from dataset_table;")
+    last_id = cursor.fetchone()[0]
+
+    cursor.execute("""INSERT INTO dataset_table(id, stable_id, description, access_type,
                                                 reference_genome, variant_cnt, call_cnt,
                                                 sample_cnt)
-                      VALUES (%s, %s, %s, %s, %s, %s, %s)
-                      RETURNING id""", (f"{dataset_name}_{access_type}",
+                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                      RETURNING id""", (last_id+1, f"{dataset_name}_{access_type}",
                                         f"{dataset_description} {access_type} access",
                                         access_type, "GRCh37", 100, 100, len(samples)))
     dataset_id = cursor.fetchone()[0]
@@ -53,9 +56,11 @@ def ingest(connection, cursor, data, samples, vcffile, dataset_name, dataset_des
             if isinstance(geographic_origin, list):
                 geographic_origin = geographic_origin[0]
 
-        cursor.execute("""INSERT INTO individual(stable_id, sex, ethnicity, geographic_origin)
-                          VALUES (%s, %s, %s, %s)
-                          RETURNING id""", (stable_id, sex, ethnicity, geographic_origin))
+        cursor.execute("SELECT MAX(id) from individual;")
+        last_id = cursor.fetchone()[0]
+        cursor.execute("""INSERT INTO individual(id, stable_id, sex, ethnicity, geographic_origin)
+                          VALUES (%s, %s, %s, %s, %s)
+                          RETURNING id""", (last_id + 1, stable_id, sex, ethnicity, geographic_origin))
         patient_id = cursor.fetchone()[0]
         print(patient_id, stable_id, sex, ethnicity, geographic_origin)
 
@@ -70,25 +75,34 @@ def ingest(connection, cursor, data, samples, vcffile, dataset_name, dataset_des
                 if disease_name == "oncological":
                     disease_name = "Cancer"
 
-                cursor.execute("""INSERT INTO individual_disease_table(individual_id, disease_id, age)
-                               VALUES (%s, %s, %s)""",
-                               (patient_id, disease, dob))
+                cursor.execute("SELECT MAX(id) from individual_disease_table;")
+                last_id = cursor.fetchone()[0]
+                cursor.execute("""INSERT INTO individual_disease_table(id, individual_id, disease_id, age)
+                               VALUES (%s, %s, %s, %s)""",
+                               (last_id+1, patient_id, disease, dob))
 
         if sample:
-            cursor.execute("""INSERT INTO sample_table(stable_id, individual_id, individual_age_at_collection, collection_date)
+            cursor.execute("SELECT MAX(id) from sample_table;")
+            last_id = cursor.fetchone()[0]
+            cursor.execute("""INSERT INTO sample_table(id, stable_id, individual_id, individual_age_at_collection, collection_date)
                             VALUES (%s, %s, %s, %s, %s)
-                            RETURNING id""", (sample, patient_id, age, now))
+                            RETURNING id""", (last_id + 1, sample, patient_id, age, now))
             sample_id = cursor.fetchone()[0]
             sample_to_id[sample] = sample_id
             
 
-            cursor.execute("""INSERT INTO dataset_sample_table(dataset_id, sample_id)
-                            VALUES (%s, %s)""", (dataset_id, sample_id))
+            cursor.execute("SELECT MAX(id) from dataset_sample_table;")
+            last_id = cursor.fetchone()[0]
+            cursor.execute("""INSERT INTO dataset_sample_table(id, dataset_id, sample_id)
+                            VALUES (%s, %s, %s)""", (last_id + 1, dataset_id, sample_id))
 
         connection.commit()
 
     nsamples = len(samples)
     count, callcount = 0, 0
+    cursor.execute("SELECT MAX(id) from variant_table;")
+    last_variant_table_id = cursor.fetchone()[0]
+    cur_var_id = last_variant_table_id + 1
     if nsamples > 0:
         vcf_reader = vcf.Reader(open(vcffile, 'r'))
         for record in vcf_reader:
@@ -99,11 +113,12 @@ def ingest(connection, cursor, data, samples, vcffile, dataset_name, dataset_des
             chrom, ref, alt = record.CHROM, record.REF, str(record.ALT[0])
             endpos = startpos + len(ref) - 1
 
-            cursor.execute("""INSERT INTO variant_table(dataset_id, variant_id, refseq, reference, alternate, start, "end", call_cnt, sample_cnt, matching_sample_cnt, frequency)
-                              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            cursor.execute("""INSERT INTO variant_table(id, dataset_id, variant_id, refseq, reference, alternate, start, "end", call_cnt, sample_cnt, matching_sample_cnt, frequency)
+                              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                               RETURNING id""",
-                              (dataset_id, record.ID, chrom, ref, alt, startpos, endpos, nsamples, nsamples, len(has_var), 1.*len(has_var)/nsamples))
+                              (cur_var_id, dataset_id, record.ID, chrom, ref, alt, startpos, endpos, nsamples, nsamples, len(has_var), 1.*len(has_var)/nsamples))
             variant_id = cursor.fetchone()[0]
+            cur_var_id = cur_var_id + 1
 
             samples_w_variant = [(variant_id, sample_to_id[samp]) for samp in has_var]
             cursor.executemany("""INSERT INTO variant_sample_table(data_id, sample_id)
@@ -145,11 +160,11 @@ def main():
     Parse arguments, make database connection, read file, and start ingest
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--server", help="Postgres server hostname", default="0.0.0.0")
-    parser.add_argument("--port", help="Postgres server port", default=5049)
+    parser.add_argument("--server", help="Postgres server hostname", default="localhost")
+    parser.add_argument("--port", help="Postgres server port", default=5432)
     parser.add_argument("--username", help="Postgres username", default="beacon")
-    parser.add_argument("--password", help="Postgres password", default="secretpassword")
     parser.add_argument("--database", help="Postgres database", default="beacon")
+    parser.add_argument("--password", help="Postgres password", default="secretpassword")
     parser.add_argument("--vcffile", help="VCF file", default=None)
     parser.add_argument("-n", "--dataset_name", default="synthetic_childdemo")
     parser.add_argument("-D", "--dataset_description", default="Synthetic CHILD demo for MTR")
@@ -187,7 +202,7 @@ def main():
         samples = []
 
     ingest(connection, cursor, data, samples, args.vcffile,
-           args.datset_name, args.dataset_description,
+           args.dataset_name, args.dataset_description,
            full_access=args.full_access)
 
 if __name__ == "__main__":
