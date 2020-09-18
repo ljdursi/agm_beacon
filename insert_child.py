@@ -12,16 +12,25 @@ import psycopg2 as pg
 import vcf
 
 
-def ingest(connection, cursor, data, samples, vcffile):
+def ingest(connection, cursor, data, samples, vcffile, dataset_name, dataset_description, full_access=False):
     """
     Given the Postgres connection, a cursor, and the data, insert the
     relevant data into the postgres database.
     """
     now = datetime.datetime.now()
 
-    cursor.execute("""INSERT INTO beacon_dataset_table(stable_id, description, access_type, reference_genome, variant_cnt, call_cnt, sample_cnt)
+    if full_access:
+        access_type = "REGISTERED"
+    else:
+        access_type = "CONTROLLED"
+
+    cursor.execute("""INSERT INTO dataset_table(stable_id, description, access_type,
+                                                reference_genome, variant_cnt, call_cnt,
+                                                sample_cnt)
                       VALUES (%s, %s, %s, %s, %s, %s, %s)
-                      RETURNING id""", ("childdemo", "CHILD db demo for AGM", "PUBLIC", "GRCh37", 100, 100, len(samples)))
+                      RETURNING id""", (f"{dataset_name}_{access_type}",
+                                        f"{dataset_description} {access_type} access",
+                                        access_type, "GRCh37", 100, 100, len(samples)))
     dataset_id = cursor.fetchone()[0]
 
     padded_samples = samples + [None]*len(data)
@@ -29,34 +38,51 @@ def ingest(connection, cursor, data, samples, vcffile):
 
     for idnum, (patient, sample) in enumerate(zip(data, padded_samples)):
         demographic = patient["demographic"]
-        stable_id = f"CHILD{(idnum+1):03d}"
+        stable_id = f"Sythetic_CHILD{(idnum+1):03d}"
+
         sex = demographic["biologicalSex"].lower()
+        ethnicity = demographic.get("ethnicity", "")
+        if isinstance(ethnicity, list):
+            ethnicity = ethnicity[0]
         dob = datetime.datetime.strptime(demographic["age"], "%d-%b-%y")
-        age_of_onset = dateutil.relativedelta.relativedelta(now, dob).years
+        age = dateutil.relativedelta.relativedelta(now, dob).years
+
+        geographic_origin = ""
+        if "residence" in demographic:
+            geographic_origin = demographic("residence")
+            if isinstance(geographic_origin, list):
+                geographic_origin = geographic_origin[0]
+
+        cursor.execute("""INSERT INTO individual(stable_id, sex, ethnicity, geographic_origin)
+                          VALUES (%s, %s, %s, %s)
+                          RETURNING id""", (stable_id, sex, ethnicity, geographic_origin))
+        patient_id = cursor.fetchone()[0]
+        print(patient_id, stable_id, sex, ethnicity, geographic_origin)
 
         diseases = patient["diseases"]
-        disease = ""
-        if "bloodRelatedDisorders" in diseases and (not diseases["bloodRelatedDisorders"][0] in ["Never", "No"]):
-            disease = "bloodRelatedDisorders"
-        elif "respiratorySystem" in diseases and (not diseases["respiratorySystem"][0] in ["Never", "No"]):
-            disease = "respiratorySystem"
-        elif "circulatorySystem" in diseases and (not diseases["circulatorySystem"][0] in ["Never", "No"]):
-            disease = "circulatorySystem"
+        for disease, present in diseases.items():
+            if isinstance(present, str):
+                present = [present]
+            has_disease = any([p not in ["No", "Never"] for p in present])
 
-        cursor.execute("""INSERT INTO patient_table(stable_id, sex, age_of_onset, disease)
-                          VALUES (%s, %s, %s, %s)
-                          RETURNING id""", (stable_id, sex, age_of_onset, disease))
-        patient_id = cursor.fetchone()[0]
-        print(patient_id, stable_id, sex, age_of_onset, disease)
+            if has_disease:
+                disease_name = disease
+                if disease_name == "oncological":
+                    disease_name = "Cancer"
+
+                cursor.execute("""INSERT INTO individual_disease_table(individual_id, disease_id, age)
+                               VALUES (%s, %s, %s)""",
+                               (patient_id, disease, dob))
 
         if sample:
-            cursor.execute("""INSERT INTO beacon_sample_table(stable_id, sex, tissue, patient_id)
-                            VALUES (%s, %s, %s, %s)
-                            RETURNING id""", (sample, sex, "blood", patient_id))
+            cursor.execute("""INSERT INTO sample_table(stable_id, individual_id, individual_age_at_collection, collection_date)
+                            VALUES (%s, %s, %s, %s, %s)
+                            RETURNING id""", (sample, patient_id, age, now))
             sample_id = cursor.fetchone()[0]
             sample_to_id[sample] = sample_id
+            
 
-            cursor.execute("""INSERT INTO beacon_dataset_sample_table(dataset_id, sample_id)
+            cursor.execute("""INSERT INTO dataset_sample_table(dataset_id, sample_id)
                             VALUES (%s, %s)""", (dataset_id, sample_id))
 
         connection.commit()
@@ -72,14 +98,15 @@ def ingest(connection, cursor, data, samples, vcffile):
             startpos = record.POS
             chrom, ref, alt = record.CHROM, record.REF, str(record.ALT[0])
             endpos = startpos + len(ref) - 1
-            cursor.execute("""INSERT INTO beacon_data_table(dataset_id, variant_id, chromosome, reference, alternate, start, "end", call_cnt, sample_cnt, matching_sample_cnt, frequency)
+
+            cursor.execute("""INSERT INTO variant_table(dataset_id, variant_id, refseq, reference, alternate, start, "end", call_cnt, sample_cnt, matching_sample_cnt, frequency)
                               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                               RETURNING id""",
                               (dataset_id, record.ID, chrom, ref, alt, startpos, endpos, nsamples, nsamples, len(has_var), 1.*len(has_var)/nsamples))
             variant_id = cursor.fetchone()[0]
 
             samples_w_variant = [(variant_id, sample_to_id[samp]) for samp in has_var]
-            cursor.executemany("""INSERT INTO beacon_data_sample_table(data_id, sample_id)
+            cursor.executemany("""INSERT INTO variant_sample_table(data_id, sample_id)
                                   VALUES(%s,%s)""", samples_w_variant)
             count += 1
             callcount += len(has_var)
@@ -89,32 +116,15 @@ def ingest(connection, cursor, data, samples, vcffile):
             if count % 1000 == 0:
                 break
 
-        cursor.execute("""UPDATE beacon_dataset_table
-                          SET variant_cnt=%s, call_cnt=%s
-                          WHERE id=%s""",
-                          (count, callcount, dataset_id))
         cursor.execute("""INSERT INTO dataset_access_level_table
                           (dataset_id, parent_field, field, access_level)
                           VALUES (%s, 'accessLevelSummary', '-', 'PUBLIC')""",
                           (dataset_id,))
-        cursor.execute("""INSERT INTO beacon_dataset_consent_code_table
+        cursor.execute("""INSERT INTO dataset_consent_code_table
                           (dataset_id, consent_code_id , additional_constraint, version) 
                           VALUES (%s, 1, null, 'v1.0')""",
                           (dataset_id,))
         connection.commit()
-
-
-def clear_tables(connection, cursor):
-    """
-    Rmove initial data if any from Beacon 2.x tables
-    """
-    cursor.execute("""TRUNCATE TABLE patient_table, beacon_data_table, beacon_sample_table,
-                      beacon_dataset_table, beacon_dataset_sample_table, beacon_data_sample_table,
-                      tmp_data_sample_table, tmp_sample_table,
-                      beacon_dataset_consent_code_table, dataset_access_level_table""")
-    connection.commit()
-
-    return
 
 
 def vcf_samples(vcffile):
@@ -141,6 +151,9 @@ def main():
     parser.add_argument("--password", help="Postgres password", default="secretpassword")
     parser.add_argument("--database", help="Postgres database", default="beacon")
     parser.add_argument("--vcffile", help="VCF file", default=None)
+    parser.add_argument("-n", "--dataset_name", default="synthetic_childdemo")
+    parser.add_argument("-D", "--dataset_description", default="Synthetic CHILD demo for MTR")
+    parser.add_argument("-F", "--full_access", action="store_true")
     parser.add_argument("datafile", default="./child.json")
     args = parser.parse_args()
 
@@ -173,8 +186,9 @@ def main():
     else:
         samples = []
 
-    clear_tables(connection, cursor)
-    ingest(connection, cursor, data, samples, args.vcffile)
+    ingest(connection, cursor, data, samples, args.vcffile,
+           args.datset_name, args.dataset_description,
+           full_access=args.full_access)
 
 if __name__ == "__main__":
     main()
